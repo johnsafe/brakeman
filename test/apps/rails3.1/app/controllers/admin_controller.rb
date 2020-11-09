@@ -17,4 +17,35 @@ class AdminController < ApplicationController
 
     some_method(params[:class]).constantize
   end
+
+  def authenticate_user!
+    correct_password = "7001337"
+
+    authenticate_or_request_with_http_basic do |username, password|
+      username == "foo" && password == correct_password
+    end
+  end
+
+  def show_detailed_exceptions?
+    yeah_sure_they_are_an_admin_right? current_user
+  end
+
+  def make_system_calls
+    `#{"blah #{why?}"}`
+
+    # Some command injection of literals
+    # which should not raise warnings 
+    or_input = if admin
+                 "rm -rf"
+               else
+                 :symbol
+               end
+
+    system "cd / && #{or_input}"
+    `cd / && #{or_input}`
+
+    system "echo #{1}"
+    exec "nmap 192.168.#{1}.1"
+
+  end
 end

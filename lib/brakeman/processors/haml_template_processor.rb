@@ -4,22 +4,6 @@ require 'brakeman/processors/template_processor'
 class Brakeman::HamlTemplateProcessor < Brakeman::TemplateProcessor
   HAML_FORMAT_METHOD = /format_script_(true|false)_(true|false)_(true|false)_(true|false)_(true|false)_(true|false)_(true|false)/
   
-  def initialize *args
-    super
-
-    @tracker.libs.each do |name, lib|
-      if name.to_s =~ /^Haml::Filters/
-        begin
-          require lib[:file]
-        rescue Exception => e
-          if @tracker.options[:debug]
-            raise e
-          end
-        end
-      end
-    end
-  end
-
   #Processes call, looking for template output
   def process_call exp
     target = exp.target
@@ -95,7 +79,7 @@ class Brakeman::HamlTemplateProcessor < Brakeman::TemplateProcessor
     else
       #TODO: Do we really need a new Sexp here?
       call = make_call target, method, process_all!(exp.args)
-      call.original_line(exp.original_line)
+      call.original_line = exp.original_line
       call.line(exp.line)
       call
     end
@@ -103,6 +87,7 @@ class Brakeman::HamlTemplateProcessor < Brakeman::TemplateProcessor
 
   #If inside an output stream, only return the final expression
   def process_block exp
+    exp = exp.dup
     exp.shift
     if @inside_concat
       @inside_concat = false

@@ -16,6 +16,9 @@ class Brakeman::CheckSend < Brakeman::BaseCheck
   end
 
   def process_result result
+    return if duplicate? result or result[:call].original_line
+    add_result result
+
     process_call_args result[:call]
     target = process result[:call].target
 
@@ -27,16 +30,6 @@ class Brakeman::CheckSend < Brakeman::BaseCheck
         :code => result[:call],
         :user_input => input.match,
         :confidence => CONFIDENCE[:high]
-    end
-
-    if input = has_immediate_user_input?(target)
-      warn :result => result,
-        :warning_type => "Dangerous Send",
-        :warning_code => :dangerous_send,
-        :message => "User defined target of method invocation",
-        :code => result[:call],
-        :user_input => input.match,
-        :confidence => CONFIDENCE[:med]
     end
   end
 end

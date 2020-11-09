@@ -8,17 +8,20 @@ module Brakeman
       root = options[:app_path]
 
       # Convert files into Regexp for matching
+      init_options = {}
       if options[:skip_files]
-        list = "(?:" << options[:skip_files].map { |f| Regexp.escape f }.join("|") << ")$"
-        new(root, Regexp.new(list))
-      else
-        new(root)
+        init_options[:skip_files] = Regexp.new("(?:" << options[:skip_files].map { |f| Regexp.escape f }.join("|") << ")$")
       end
+      if options[:only_files]
+        init_options[:only_files] = Regexp.new("(?:" << options[:only_files].map { |f| Regexp.escape f }.join("|") << ")")
+      end
+      new(root, init_options)
     end
 
-    def initialize(root, skip_files = nil)
+    def initialize(root, init_options = {})
       @root = root
-      @skip_files = skip_files
+      @skip_files = init_options[:skip_files]
+      @only_files = init_options[:only_files]
     end
 
     def expand_path(path)
@@ -63,27 +66,35 @@ module Brakeman
     end
 
     def layout_exists?(name)
-      pattern = "#{@root}/app/views/layouts/#{name}.html.{erb,haml,slim}"
+      pattern = "#{@root}/{engines/*/,}app/views/layouts/#{name}.html.{erb,haml,slim}"
       !Dir.glob(pattern).empty?
     end
 
     def lib_paths
-      @lib_files ||= find_paths("lib")
+      @lib_files ||= find_paths("lib").reject { |path| path.include? "/generators/" }
     end
 
   private
 
     def find_paths(directory, extensions = "*.rb")
-      pattern = @root + "/#{directory}/**/#{extensions}"
+      pattern = @root + "/{engines/*/,}#{directory}/**/#{extensions}"
 
-      Dir.glob(pattern).sort.tap do |paths|
-        reject_skipped_files(paths)
-      end
+      select_files(Dir.glob(pattern).sort)
+    end
+
+    def select_files(paths)
+      paths = select_only_files(paths)
+      reject_skipped_files(paths)
+    end
+
+    def select_only_files(paths)
+      return paths unless @only_files
+      paths.select { |f| @only_files.match f }
     end
 
     def reject_skipped_files(paths)
-      return unless @skip_files
-      paths.reject! { |f| @skip_files.match f }
+      return paths unless @skip_files
+      paths.reject { |f| @skip_files.match f }
     end
 
   end

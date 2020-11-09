@@ -120,7 +120,7 @@ module Brakeman::RenderHelper
         unless value.original_line
           #TODO: This has been broken for a while now and no one noticed
           #so maybe we can skip it
-          value.original_line(value.line)
+          value.original_line = value.line
         end
       end
 
@@ -161,9 +161,10 @@ module Brakeman::RenderHelper
     if call? sexp
       get_class_target sexp.target
     else
-      begin
-        class_name sexp
-      rescue
+      klass = class_name sexp
+      if klass.is_a? Symbol
+        klass
+      else
         nil
       end
     end

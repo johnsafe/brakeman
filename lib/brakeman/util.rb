@@ -172,6 +172,12 @@ module Brakeman::Util
                         exp.node_type == :nil)
   end
 
+  #Check if _exp_ represents a block of code
+  def block? exp
+    exp.is_a? Sexp and (exp.node_type == :block or
+                        exp.node_type == :rlist)
+  end
+
   #Check if _exp_ is a params hash
   def params? exp
     if exp.is_a? Sexp
@@ -269,6 +275,8 @@ module Brakeman::Util
 
     if warning.file
       File.expand_path warning.file, tracker.options[:app_path]
+    elsif warning.template.is_a? Hash and warning.template[:file]
+      warning.template[:file]
     else
       case warning.warning_set
       when :controller
@@ -299,7 +307,7 @@ module Brakeman::Util
     unless type
       if string_name =~ /Controller$/
         type = :controller
-      elsif camelize(string_name) == string_name
+      elsif camelize(string_name) == string_name # This is not always true
         type = :model
       else
         type = :template
@@ -319,7 +327,7 @@ module Brakeman::Util
       if tracker.models[name] and tracker.models[name][:file]
         path = tracker.models[name][:file]
       else
-        path += "/app/controllers/#{underscore(string_name)}.rb"
+        path += "/app/models/#{underscore(string_name)}.rb"
       end
     when :template
       if tracker.templates[name] and tracker.templates[name][:file]
@@ -376,8 +384,11 @@ module Brakeman::Util
   end
 
   def truncate_table str
-    @terminal_width ||= if $stdin && $stdin.tty?
-                          ::HighLine::SystemExtensions::terminal_size[0]
+    @terminal_width ||= if @tracker.options[:table_width]
+                          @tracker.options[:table_width]
+                        elsif $stdin && $stdin.tty?
+                          Brakeman.load_brakeman_dependency 'highline'
+                          ::HighLine.new.terminal_size[0]
                         else
                           80
                         end
@@ -394,6 +405,7 @@ module Brakeman::Util
 
   # rely on Terminal::Table to build the structure, extract the data out in CSV format
   def table_to_csv table
+    Brakeman.load_brakeman_dependency 'terminal-table'
     output = CSV.generate_line(table.headings.cells.map{|cell| cell.to_s.strip})
     table.rows.each do |row|
       output << CSV.generate_line(row.cells.map{|cell| cell.to_s.strip})

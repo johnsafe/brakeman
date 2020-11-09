@@ -19,13 +19,14 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
   def initialize tracker = nil
     super()
     @env = SexpProcessor::Environment.new
-    @inside_if = []
+    @inside_if = false
     @ignore_ifs = nil
     @exp_context = []
     @current_module = nil
     @tracker = tracker #set in subclass as necessary
     @helper_method_cache = {}
     @helper_method_info = Hash.new({})
+    @or_depth_limit = (tracker && tracker.options[:branch_limit]) || 5 #arbitrary default
     set_env_defaults
   end
 
@@ -63,7 +64,7 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
 
     #Generic replace
     if replacement = env[exp] and not duplicate? replacement
-      result = set_line replacement.deep_clone, exp.line
+      result = replacement.deep_clone(exp.line)
     else
       result = exp
     end
@@ -86,6 +87,10 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     target = exp.target
     method = exp.method
     first_arg = exp.first_arg
+
+    if method == :send or method == :try
+      collapse_send_call exp, first_arg
+    end
 
     if node_type? target, :or and [:+, :-, :*, :/].include? method
       res = process_or_simple_operation(exp)
@@ -167,6 +172,41 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     exp
   end
 
+  def process_call_with_block exp
+    exp[1] = process exp.block_call
+
+    env.scope do
+      exp.block_args.each do |e|
+        #Force block arg(s) to be local
+        if node_type? e, :lasgn
+          env.current[Sexp.new(:lvar, e.lhs)] = e.rhs
+        elsif node_type? e, :masgn
+          e[1..-1].each do |var|
+            local = Sexp.new(:lvar, var)
+            env.current[local] = local
+          end
+        elsif e.is_a? Symbol
+          local = Sexp.new(:lvar, e)
+          env.current[local] = local
+        else
+          raise "Unexpected value in block args: #{e.inspect}"
+        end
+      end
+
+      block = exp.block
+
+      if block? block
+        process_all! block
+      else
+        exp[3] = process block
+      end
+    end
+
+    exp
+  end
+
+  alias process_iter process_call_with_block
+
   #Process a new scope.
   def process_scope exp
     env.scope do
@@ -184,11 +224,22 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
 
   #Process a method definition.
   def process_methdef exp
-    env.scope do
-      set_env_defaults
+    meth_env do
       exp.body = process_all! exp.body
     end
     exp
+  end
+
+  def meth_env
+    begin
+      env.scope do
+        set_env_defaults
+        @meth_env = env.current
+        yield
+      end
+    ensure
+      @meth_env = nil
+    end
   end
 
   #Process a method definition on self.
@@ -232,8 +283,9 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
   def process_gasgn exp
     match = Sexp.new(:gvar, exp.lhs)
     value = exp.rhs = process(exp.rhs)
+    value.line = exp.line
 
-    set_value match, value, exp.line
+    set_value match, value
 
     exp
   end
@@ -244,7 +296,7 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     match = Sexp.new(:cvar, exp.lhs)
     value = exp.rhs = process(exp.rhs)
 
-    set_value match, value, exp.line
+    set_value match, value
 
     exp
   end
@@ -265,7 +317,7 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
       value = exp.second_arg = process(value_arg)
       match = Sexp.new(:call, target, :[], index)
 
-      set_value match, value, exp.line
+      set_value match, value
 
       if hash? target
         env[tar_variable] = hash_insert target.deep_clone, index, value
@@ -275,7 +327,7 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
       #This is what we'll replace with the value
       match = Sexp.new(:call, target, method.to_s[0..-2].to_sym)
 
-      set_value match, value, exp.line
+      set_value match, value
     else
       raise "Unrecognized assignment: #{exp}"
     end
@@ -318,7 +370,7 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
 
     unless env[match]
       if request_value? target
-        env[match] = Sexp.new(:or, match, value)
+        env[match] = match.combine(value)
       else
         env[match] = value
       end
@@ -377,32 +429,83 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
 
     condition = process exp.condition
 
+    #Check if a branch is obviously going to be taken
     if true? condition
       no_branch = true
-      exps = [exp.then_clause]
+      exps = [exp.then_clause, nil]
     elsif false? condition
       no_branch = true
-      exps = [exp.else_clause]
+      exps = [nil, exp.else_clause]
     else
       no_branch = false
       exps = [exp.then_clause, exp.else_clause]
     end
 
-    exps.each do |e|
-      @inside_if << [] unless no_branch or @ignore_ifs
+    if @ignore_ifs or no_branch
+      exps.each_with_index do |branch, i|
+        exp[2 + i] = process_if_branch branch
+      end
+    else
+      was_inside = @inside_if
+      @inside_if = true
 
-      if sexp? e
-        if e.node_type == :block
-          process_default e #avoid creating new scope
-        else
-          process e
+      branch_scopes = []
+      exps.each_with_index do |branch, i|
+        scope do
+          @branch_env = env.current
+          branch_index = 2 + i # s(:if, condition, then_branch, else_branch)
+          exp[branch_index] = process_if_branch branch
+          branch_scopes << env.current
+          @branch_env = nil
         end
       end
 
-      @inside_if.pop unless no_branch or @ignore_ifs
+      @inside_if = was_inside
+
+      branch_scopes.each do |s|
+        merge_if_branch s
+      end
     end
 
     exp
+  end
+
+  def process_if_branch exp
+    if sexp? exp
+      if block? exp
+        process_default exp
+      else
+        process exp
+      end
+    end
+  end
+
+  def merge_if_branch branch_env
+    branch_env.each do |k, v|
+      next if v.nil?
+
+      current_val = env[k]
+
+      if current_val
+        unless same_value?(current_val, v)
+          if too_deep? current_val
+            # Give up branching, start over with latest value
+            env[k] = v
+          else
+            env[k] = current_val.combine(v, k.line)
+          end
+        end
+      else
+        env[k] = v
+      end
+    end
+  end
+
+  def too_deep? exp
+    @or_depth_limit >= 0 and
+    node_type? exp, :or and
+    exp.or_depth and
+    exp.or_depth >= @or_depth_limit
   end
 
   #Process single integer access to an array.
@@ -441,6 +544,17 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
       string1
     else
       result
+    end
+  end
+
+  # Change x.send(:y, 1) to x.y(1)
+  def collapse_send_call exp, first_arg
+    return unless symbol? first_arg or string? first_arg
+    exp.method = first_arg.value.to_sym
+    args = exp.args
+    exp.pop # remove last arg
+    if args.length > 1
+      exp.arglist = args[1..-1]
     end
   end
 
@@ -580,20 +694,6 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     meth_env
   end
 
-  #Set line nunber for +exp+ and every Sexp it contains. Used when replacing
-  #expressions, so warnings indicate the correct line.
-  def set_line exp, line_number
-    if sexp? exp
-      exp.original_line(exp.original_line || exp.line)
-      exp.line line_number
-      exp.each do |e|
-        set_line e, line_number
-      end
-    end
-
-    exp
-  end
-
   #Finds the inner most call target which is not the target of a call to <<
   def find_push_target exp
     if call? exp and exp.method == :<<
@@ -615,12 +715,6 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     nil
   end
 
-  #Return true if this value should be "branched" - i.e. converted into an or
-  #expression with two or more values
-  def branch_value? exp
-    not (@inside_if.empty? or @inside_if.last.include? exp)
-  end
-
   #Return true if lhs == rhs or lhs is an or expression and
   #rhs is one of its values
   def same_value? lhs, rhs
@@ -633,32 +727,51 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
     end
   end
 
+  def value_from_if exp
+    if block? exp.else_clause or block? exp.then_clause
+      #If either clause is more than a single expression, just use entire
+      #if expression for now
+      exp
+    elsif exp.else_clause.nil?
+      exp.then_clause
+    elsif exp.then_clause.nil?
+      exp.else_clause
+    else
+      condition = exp.condition
+
+      if true? condition
+        exp.then_clause
+      elsif false? condition
+        exp.else_clause
+      else
+        exp.then_clause.combine(exp.else_clause, exp.line)
+      end
+    end
+  end
+
   #Set variable to given value.
   #Creates "branched" versions of values when appropriate.
   #Avoids creating multiple branched versions inside same
   #if branch.
-  def set_value var, value, line = nil
-    unless @ignore_ifs
-      current_val = env[var]
-      current_if = @inside_if.last
+  def set_value var, value
+    if node_type? value, :if
+      value = value_from_if(value)
+    end
 
-      if branch_value? var and current_val = env[var]
-        unless same_value? current_val, value
-          env[var] = Sexp.new(:or, current_val, value).line(line || var.line || -2)
-          current_if << var
-        end
-      elsif current_if and current_if.include?(var) and node_type?(current_val, :or)
-        #Replace last value instead of creating another or
-        current_val.rhs = value
+    if @ignore_ifs or not @inside_if
+      if @meth_env and node_type? var, :ivar and env[var].nil?
+        @meth_env[var] = value
       else
         env[var] = value
-
-        if current_if
-          current_if << var
-        end
       end
+    elsif env.current[var]
+      env.current[var] = value
+    elsif @branch_env and @branch_env[var]
+      @branch_env[var] = value
+    elsif @branch_env and @meth_env and node_type? var, :ivar
+      @branch_env[var] = value
     else
-      env[var] = value
+      env.current[var] = value
     end
   end
 
@@ -701,5 +814,4 @@ class Brakeman::AliasProcessor < Brakeman::SexpProcessor
       false
     end
   end
-
 end

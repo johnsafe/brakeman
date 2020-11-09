@@ -23,23 +23,61 @@ class Brakeman::ControllerProcessor < Brakeman::BaseProcessor
   #s(:class, NAME, PARENT, s(:scope ...))
   def process_class exp
     name = class_name(exp.class_name)
+    parent = class_name(exp.parent_name)
 
-    if @controller
-      Brakeman.debug "[Notice] Skipping inner class: #{name}"
-      return ignore
+    #If inside a real controller, treat any other classes as libraries.
+    #But if not inside a controller already, then the class may include
+    #a real controller, so we can't take this shortcut.
+    if @controller and @controller[:name].to_s.end_with? "Controller"
+      Brakeman.debug "[Notice] Treating inner class as library: #{name}"
+      Brakeman::LibraryProcessor.new(@tracker).process_library exp, @file_name
+      return exp
+    end
+
+    if not name.to_s.end_with? "Controller"
+      Brakeman.debug "[Notice] Adding noncontroller as library: #{name}"
+
+      current_controller = @controller
+
+      #Set the class to be a module in order to get the right namespacing.
+      #Add class to libraries, in case it is needed later (e.g. it's used
+      #as a parent class for a controller.)
+      #However, still want to process it in this class, so have to set
+      #@controller to this not-really-a-controller thing.
+      process_module exp do
+        name = @current_module
+
+        if @tracker.libs[name.to_sym]
+          @controller = @tracker.libs[name]
+        else
+          set_controller name, parent, exp
+          @tracker.libs[name.to_sym] = @controller
+        end
+
+        process_all exp.body
+      end
+
+      @controller = current_controller
+
+      return exp
     end
 
     if @current_module
       name = (@current_module.to_s + "::" + name.to_s).to_sym
     end
 
-    begin
-      parent = class_name exp.parent_name
-    rescue StandardError => e
-      Brakeman.debug e
-      parent = nil
-    end
+    set_controller name, parent, exp
 
+    @tracker.controllers[@controller[:name]] = @controller
+
+    exp.body = process_all! exp.body
+    set_layout_name
+
+    @controller = nil
+    exp
+  end
+
+  def set_controller name, parent, exp
     @controller = { :name => name,
                     :parent => parent,
                     :includes => [],
@@ -49,11 +87,6 @@ class Brakeman::ControllerProcessor < Brakeman::BaseProcessor
                     :options => {:before_filters => []},
                     :src => exp,
                     :file => @file_name }
-    @tracker.controllers[@controller[:name]] = @controller
-    exp.body = process_all! exp.body
-    set_layout_name
-    @controller = nil
-    exp
   end
 
   #Look for specific calls inside the controller
@@ -187,6 +220,11 @@ class Brakeman::ControllerProcessor < Brakeman::BaseProcessor
   #We build a new method and process that the same way as usual
   #methods and filters.
   def add_fake_filter exp
+    unless @controller
+      Brakeman.debug "Skipping before_filter outside controller: #{exp}"
+      return exp
+    end
+
     filter_name = ("fake_filter" + rand.to_s[/\d+$/]).to_sym
     args = exp.block_call.arglist
     args.insert(1, Sexp.new(:lit, filter_name))

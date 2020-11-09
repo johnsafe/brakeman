@@ -12,6 +12,14 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
   CONFIDENCE = { :high => 0, :med => 1, :low => 2 }
 
   Match = Struct.new(:type, :match)
+  
+  class << self
+    attr_accessor :name
+  
+    def inherited(subclass)
+      subclass.name = subclass.to_s.match(/^Brakeman::(.*)$/)[1]
+    end
+  end
 
   #Initialize Check with Checks.
   def initialize(app_tree, tracker)
@@ -26,12 +34,12 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     @active_record_models = nil
     @mass_assign_disabled = nil
     @has_user_input = nil
-    @safe_input_attributes = Set[:to_i, :to_f, :arel_table]
+    @safe_input_attributes = Set[:to_i, :to_f, :arel_table, :id]
   end
 
   #Add result to result list, which is used to check for duplicates
   def add_result result, location = nil
-    location ||= (@current_template && @current_template[:name]) || @current_class || @current_module || @current_set || result[:location][1]
+    location ||= (@current_template && @current_template[:name]) || @current_class || @current_module || @current_set || result[:location][:class] || result[:location][:template]
     location = location[:name] if location.is_a? Hash
     location = location.to_sym
 
@@ -116,9 +124,11 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
 
   #Report a warning
   def warn options
-    extra_opts = { :check => self.class.to_s, :relative_file => relative_path(options[:file]) }
+    extra_opts = { :check => self.class.to_s }
+
     warning = Brakeman::Warning.new(options.merge(extra_opts))
     warning.file = file_for warning
+    warning.relative_path = relative_path(warning.file)
 
     @warnings << warning
   end
@@ -163,7 +173,6 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     @mass_assign_disabled = false
 
     if version_between?("3.1.0", "3.9.9") and
-      tracker.config[:rails] and
       tracker.config[:rails][:active_record] and
       tracker.config[:rails][:active_record][:whitelist_attributes] == Sexp.new(:true)
 
@@ -172,9 +181,30 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
       #May need to revisit dependng on what Rails 4 actually does/has
       @mass_assign_disabled = true
     else
-      matches = tracker.check_initializers(:"ActiveRecord::Base", :send)
+      #Check for ActiveRecord::Base.send(:attr_accessible, nil)
+      tracker.check_initializers(:"ActiveRecord::Base", :attr_accessible).each do |result|
+        call = result.call
+        if call? call
+          if call.first_arg == Sexp.new(:nil)
+            @mass_assign_disabled = true
+            break
+          end
+        end
+      end
 
-      if matches.empty?
+      unless @mass_assign_disabled
+        tracker.check_initializers(:"ActiveRecord::Base", :send).each do |result|
+          call = result.call
+          if call? call
+            if call.first_arg == Sexp.new(:lit, :attr_accessible) and call.second_arg == Sexp.new(:nil)
+              @mass_assign_disabled = true
+              break
+            end
+          end
+        end
+      end
+
+      unless @mass_assign_disabled
         #Check for
         #  class ActiveRecord::Base
         #    attr_accessible nil
@@ -191,17 +221,6 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
             end
           end
         end
-      else
-        #Check for ActiveRecord::Base.send(:attr_accessible, nil)
-        matches.each do |result|
-          call = result.call
-          if call? call
-            if call.first_arg == Sexp.new(:lit, :attr_accessible) and call.second_arg == Sexp.new(:nil)
-              @mass_assign_disabled = true
-              break
-            end
-          end
-        end
       end
     end
 
@@ -211,11 +230,20 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     #ActiveRecord::Base in an initializer.
     if not @mass_assign_disabled and version_between?("3.1.0", "3.9.9") and tracker.config[:gems][:strong_parameters]
       matches = tracker.check_initializers([], :include)
+      forbidden_protection = Sexp.new(:colon2, Sexp.new(:const, :ActiveModel), :ForbiddenAttributesProtection)
 
       matches.each do |result|
-        call = result.call
-        if call? call
-          if call.first_arg == Sexp.new(:colon2, Sexp.new(:const, :ActiveModel), :ForbiddenAttributesProtection)
+        if call? result.call and result.call.first_arg == forbidden_protection
+          @mass_assign_disabled = true
+        end
+      end
+
+      unless @mass_assign_disabled
+        matches = tracker.check_initializers(:"ActiveRecord::Base", [:send, :include])
+
+        matches.each do |result|
+          call = result.call
+          if call? call and (call.first_arg == forbidden_protection or call.second_arg == forbidden_protection)
             @mass_assign_disabled = true
           end
         end
@@ -236,7 +264,7 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
       raise ArgumentError
     end
 
-    location ||= (@current_template && @current_template[:name]) || @current_class || @current_module || @current_set || result[:location][1]
+    location ||= (@current_template && @current_template[:name]) || @current_class || @current_module || @current_set || result[:location][:class] || result[:location][:template]
 
     location = location[:name] if location.is_a? Hash
     location = location.to_sym
@@ -347,7 +375,11 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
       if @safe_input_attributes.include? method
         false
       elsif call? target and not method.to_s[-1,1] == "?"
-        has_immediate_model? target, out
+        if res = has_immediate_model?(target, out)
+          exp
+        else
+          false
+        end
       elsif model_name? target
         exp
       else
@@ -400,37 +432,9 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     if exp.is_a? Symbol
       @models.include? exp
     elsif sexp? exp
-      klass = nil
-      begin
-        klass = class_name exp
-      rescue StandardError
-      end
-
-      klass and @models.include? klass
+      @models.include? class_name(exp)
     else
       false
-    end
-  end
-
-  #Finds entire method call chain where +target+ is a target in the chain
-  def find_chain exp, target
-    return unless sexp? exp
-
-    case exp.node_type
-    when :output, :format
-      find_chain exp.value, target
-    when :call
-      if exp == target or include_target? exp, target
-        return exp
-      end
-    else
-      exp.each do |e|
-        if sexp? e
-          res = find_chain e, target
-          return res if res
-        end
-      end
-      nil
     end
   end
 
@@ -448,10 +452,11 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
   #Returns true if low_version <= RAILS_VERSION <= high_version
   #
   #If the Rails version is unknown, returns false.
-  def version_between? low_version, high_version
-    return false unless tracker.config[:rails_version]
+  def version_between? low_version, high_version, current_version = nil
+    current_version ||= tracker.config[:rails_version]
+    return false unless current_version
 
-    version = tracker.config[:rails_version].split(".").map! { |n| n.to_i }
+    version = current_version.split(".").map! { |n| n.to_i }
     low_version = low_version.split(".").map! { |n| n.to_i }
     high_version = high_version.split(".").map! { |n| n.to_i }
 
@@ -472,6 +477,12 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     end
 
     true
+  end
+
+  def lts_version? version
+    tracker.config[:gems] and
+    tracker.config[:gems][:'railslts-version'] and
+    version_between? version, "2.3.18.99", tracker.config[:gems][:'railslts-version']
   end
 
   def gemfile_or_environment
@@ -498,5 +509,24 @@ class Brakeman::BaseCheck < Brakeman::SexpProcessor
     end
 
     @active_record_models
+  end
+
+  def friendly_type_of input_type
+    if input_type.is_a? Match
+      input_type = input_type.type
+    end
+
+    case input_type
+    when :params
+      "parameter value"
+    when :cookies
+      "cookie value"
+    when :request
+      "request value"
+    when :model
+      "model attribute"
+    else
+      "user input"
+    end
   end
 end
